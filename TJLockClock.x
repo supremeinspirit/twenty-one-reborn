@@ -106,7 +106,7 @@ static BOOL tj_lcHideAllComplications(void) {
     return prefBool(@"lockScreenHideComplications", YES);
 }
 
-static NSArray<UIView *> *tj_lcFindWidgets(TJLCFound *f, UIWindow *win, CGRect row, BOOL all) {
+static NSArray<UIView *> *tj_lcFindWidgets(TJLCFound *f, UIWindow *win, CGRect row, BOOL everyRow) {
     NSMutableArray<UIView *> *all = [NSMutableArray array];
     tj_lcCollect(win, ^BOOL(UIView *v) { return tj_lcIsWidgetClass(v); }, all);
     NSMutableArray<UIView *> *out = [NSMutableArray array];
@@ -116,7 +116,7 @@ static NSArray<UIView *> *tj_lcFindWidgets(TJLCFound *f, UIWindow *win, CGRect r
         if (f.dateLabel && tj_lcIsDescendant(f.dateLabel, v)) continue;
         CGRect r = tj_lcWindowRect(v);
         if (r.size.height < 1) continue;
-        if (!all && fabs(CGRectGetMidY(r) - CGRectGetMidY(row)) > MAX(row.size.height, 20)) continue;
+        if (!everyRow && fabs(CGRectGetMidY(r) - CGRectGetMidY(row)) > MAX(row.size.height, 20)) continue;
         BOOL nested = NO;
         for (UIView *p = v.superview; p; p = p.superview) if ([out containsObject:p]) { nested = YES; break; }
         if (!nested) [out addObject:v];
