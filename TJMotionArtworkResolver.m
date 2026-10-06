@@ -525,3 +525,162 @@ void tj_fetchMotionVideoForSongAndAlbum(NSString * _Nullable songID,
 
     performITunesSearchFallback();
 }
+
+#pragma mark - Metadata-only lookup (third-party players)
+
+static NSString *tj_matchStrip(NSString *s) {
+    if (s.length == 0) return s;
+    NSString *t = [s stringByReplacingOccurrencesOfString:@"\\s*[\\(\\[][^\\)\\]]*[\\)\\]]" withString:@""
+                                                  options:NSRegularExpressionSearch range:NSMakeRange(0, s.length)];
+    NSRange dash = [t rangeOfString:@" - "];
+    if (dash.location != NSNotFound && dash.location > 0) t = [t substringToIndex:dash.location];
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return t.length > 0 ? t : s;
+}
+
+static NSArray<NSString *> *tj_matchTokens(NSString *s) {
+    if (s.length == 0) return @[];
+    NSString *folded = [s stringByFoldingWithOptions:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch | NSWidthInsensitiveSearch
+                                              locale:nil];
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *tok in [folded componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]]) {
+        if (tok.length > 0) [out addObject:tok];
+    }
+    return out;
+}
+
+static NSString *tj_matchFold(NSString *s) {
+    return [tj_matchTokens(s) componentsJoinedByString:@" "];
+}
+
+static BOOL tj_matchTitles(NSString *a, NSString *b) {
+    NSString *fa = tj_matchFold(a), *fb = tj_matchFold(b);
+    if (fa.length == 0 || fb.length == 0) return NO;
+    if ([fa isEqualToString:fb]) return YES;
+    return [tj_matchFold(tj_matchStrip(a)) isEqualToString:tj_matchFold(tj_matchStrip(b))];
+}
+
+static BOOL tj_matchArtists(NSString *a, NSString *b) {
+    NSSet *stop = [NSSet setWithArray:@[@"and", @"feat", @"ft", @"featuring", @"with"]];
+    NSMutableSet *sa = [NSMutableSet setWithArray:tj_matchTokens(a)];
+    NSMutableSet *sb = [NSMutableSet setWithArray:tj_matchTokens(b)];
+    [sa minusSet:stop];
+    [sb minusSet:stop];
+    if (sa.count == 0 || sb.count == 0) return NO;
+    return [sa isSubsetOfSet:sb] || [sb isSubsetOfSet:sa];
+}
+
+static NSInteger tj_matchAlbumScore(NSString *wanted, NSString *candidate) {
+    NSString *fw = tj_matchFold(wanted), *fc = tj_matchFold(candidate);
+    if (fw.length == 0) return 1;
+    if (fc.length == 0) return 0;
+    if ([fw isEqualToString:fc]) return 3;
+    NSString *sw = tj_matchFold(tj_matchStrip(wanted)), *sc = tj_matchFold(tj_matchStrip(candidate));
+    if ([sw isEqualToString:sc]) return 2;
+    if ([fc hasPrefix:[sw stringByAppendingString:@" "]] || [fw hasPrefix:[sc stringByAppendingString:@" "]]) return 1;
+    return 0;
+}
+
+static NSString *tj_storefrontCountry(void) {
+    NSString *cc = [[[NSLocale currentLocale] countryCode] lowercaseString];
+    return cc.length == 2 ? cc : @"us";
+}
+
+static void tj_storeSearch(NSString *term, NSString *entity, NSInteger limit, void (^completion)(NSArray * _Nullable results)) {
+    NSURLComponents *comps = [NSURLComponents componentsWithString:@"https://itunes.apple.com/search"];
+    comps.queryItems = @[[NSURLQueryItem queryItemWithName:@"term" value:term],
+                         [NSURLQueryItem queryItemWithName:@"media" value:@"music"],
+                         [NSURLQueryItem queryItemWithName:@"entity" value:entity],
+                         [NSURLQueryItem queryItemWithName:@"limit" value:[NSString stringWithFormat:@"%ld", (long)limit]],
+                         [NSURLQueryItem queryItemWithName:@"country" value:tj_storefrontCountry()]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:comps.URL];
+    [req setTimeoutInterval:5.0];
+    [req setValue:@"iTunes/12.0" forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
+        NSInteger status = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        NSArray *results = nil;
+        if (data && !err && status == 200) {
+            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            id r = [json isKindOfClass:[NSDictionary class]] ? json[@"results"] : nil;
+            if ([r isKindOfClass:[NSArray class]]) results = r;
+        }
+        completion(results);
+    }] resume];
+}
+
+static NSString *tj_storeIDString(id v) {
+    return [v isKindOfClass:[NSNumber class]] && [v longLongValue] > 0 ? [v stringValue] : nil;
+}
+
+void tj_fetchMotionVideoForMetadata(NSString * _Nullable songTitle,
+                                    NSString * _Nullable artistName,
+                                    NSString * _Nullable albumTitle,
+                                    void (^completion)(NSURL * _Nullable videoURL)) {
+    void (^finish)(NSURL *) = ^(NSURL *url) {
+        dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(url); });
+    };
+    NSString *artistKey = tj_normalizedKey(artistName);
+    if (!artistKey || (!tj_normalizedKey(songTitle) && !tj_normalizedKey(albumTitle))) { finish(nil); return; }
+
+    NSString *albumKey = tj_normalizedKey(albumTitle) ? [NSString stringWithFormat:@"album:%@|%@", artistKey, tj_normalizedKey(albumTitle)] : nil;
+    NSString *songKey = tj_normalizedKey(songTitle) ? [NSString stringWithFormat:@"song:%@|%@", artistKey, tj_normalizedKey(songTitle)] : nil;
+    NSURL *cached = (albumKey ? tj_cachedAlbumMotionVideoURL(albumKey) : nil) ?: (songKey ? tj_cachedAlbumMotionVideoURL(songKey) : nil);
+    if (cached) { finish(cached); return; }
+    if ((albumKey && tj_isKnownNoMotionKey(albumKey)) || (songKey && tj_isKnownNoMotionKey(songKey))) { finish(nil); return; }
+
+    void (^noMatch)(void) = ^{
+        if (albumKey) tj_recordNoMotionKey(albumKey);
+        if (songKey) tj_recordNoMotionKey(songKey);
+        finish(nil);
+    };
+    void (^resolve)(NSString *, NSString *) = ^(NSString *songID, NSString *albumID) {
+        tj_fetchMotionVideoForSongAndAlbum(songID, albumID, albumTitle, artistName, songTitle, completion);
+    };
+
+    NSString *leadArtist = [artistName componentsSeparatedByString:@", "].firstObject ?: artistName;
+
+    void (^searchAlbum)(void) = ^{
+        if (albumTitle.length == 0) { noMatch(); return; }
+        NSString *term = [NSString stringWithFormat:@"%@ %@", tj_matchStrip(albumTitle), artistName];
+        tj_storeSearch(term, @"album", 10, ^(NSArray *results) {
+            if (!results) { finish(nil); return; }
+            NSString *bestID = nil;
+            NSInteger bestScore = 1;
+            for (NSDictionary *r in results) {
+                if (![r isKindOfClass:[NSDictionary class]] || !tj_matchArtists(artistName, r[@"artistName"])) continue;
+                NSInteger score = tj_matchAlbumScore(albumTitle, r[@"collectionName"]);
+                NSString *cid = tj_storeIDString(r[@"collectionId"]);
+                if (cid && score > bestScore) { bestScore = score; bestID = cid; }
+            }
+            if (bestID) resolve(nil, bestID);
+            else noMatch();
+        });
+    };
+
+    if (songTitle.length == 0) { searchAlbum(); return; }
+
+    NSString *term = [NSString stringWithFormat:@"%@ %@", tj_matchStrip(songTitle), leadArtist];
+    tj_storeSearch(term, @"song", 25, ^(NSArray *results) {
+        if (!results) { finish(nil); return; }
+        NSString *bestSong = nil, *bestAlbum = nil, *sameAlbum = nil;
+        NSInteger bestScore = 0;
+        for (NSDictionary *r in results) {
+            if (![r isKindOfClass:[NSDictionary class]]) continue;
+            if (!tj_matchArtists(artistName, r[@"artistName"])) continue;
+            NSInteger score = tj_matchAlbumScore(albumTitle, r[@"collectionName"]);
+            NSString *cid = tj_storeIDString(r[@"collectionId"]);
+            if (!tj_matchTitles(songTitle, r[@"trackName"])) {
+                if (cid && !sameAlbum && albumTitle.length > 0 && score >= 2) sameAlbum = cid;
+                continue;
+            }
+            if (cid && score > bestScore) {
+                bestScore = score;
+                bestAlbum = cid;
+                bestSong = tj_storeIDString(r[@"trackId"]);
+            }
+        }
+        if (bestAlbum) resolve(bestSong, bestAlbum);
+        else if (sameAlbum) resolve(nil, sameAlbum);
+        else searchAlbum();
+    });
+}

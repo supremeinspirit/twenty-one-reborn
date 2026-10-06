@@ -33,4 +33,9 @@ void tj_fetchMotionVideoForSongAndAlbum(NSString * _Nullable songID,
                                        NSString * _Nullable songTitle,
                                        void (^completion)(NSURL * _Nullable videoURL));
 
+void tj_fetchMotionVideoForMetadata(NSString * _Nullable songTitle,
+                                    NSString * _Nullable artistName,
+                                    NSString * _Nullable albumTitle,
+                                    void (^completion)(NSURL * _Nullable videoURL));
+
 NS_ASSUME_NONNULL_END

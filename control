@@ -1,6 +1,6 @@
 Package: com.pisknk.twentyone
 Name: TwentyOne
-Version: 2.0
+Version: 2.0.3+spotify
 Architecture: iphoneos-arm64
 Description: what's 9+10?
 Maintainer: pisknk

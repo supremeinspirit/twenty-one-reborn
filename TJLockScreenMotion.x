@@ -61,6 +61,36 @@ static void tj_lmRecomputeFullscreen(void);
 
 #pragma mark - Local video cache
 
+static NSString *tj_lmCacheDir(void);
+
+// A short trace of the third-party (Spotify) path, kept next to the video cache.
+static void tj_lmLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void tj_lmLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("com.pisknk.twentyone.lockmotion.log", DISPATCH_QUEUE_SERIAL); });
+    NSDate *now = [NSDate date];
+    dispatch_async(q, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *dir = tj_lmCacheDir();
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *path = [dir stringByAppendingPathComponent:@"lockmotion.log"];
+        if ([[fm attributesOfItemAtPath:path error:nil] fileSize] > 128 * 1024) [fm removeItemAtPath:path error:nil];
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!h) return;
+        @try {
+            [h seekToEndOfFile];
+            [h writeData:[[NSString stringWithFormat:@"%.3f %@\n", now.timeIntervalSince1970, msg] dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (__unused id e) {}
+        [h closeFile];
+    });
+}
+
 
 static NSString *tj_lmCacheDir(void) {
     NSString *base = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
@@ -449,6 +479,73 @@ static void tj_lmLoadResolved(TJLockMotionView *mv, NSString *key, NSURL *url) {
     }
 }
 
+static void tj_lmGiveUp(TJLockMotionView *mv) {
+    [mv teardown];
+    mv.trackKey = nil;
+    mv.retryAfter = CACurrentMediaTime() + 20.0;
+}
+
+#pragma mark - Spotify (matched by metadata)
+
+typedef void (*TJLMGetClientFunc)(dispatch_queue_t, void (^)(id));
+typedef CFStringRef (*TJLMClientBundleFunc)(id);
+
+static BOOL tj_lmIsSpotifyBundle(NSString *bundleID) {
+    return [bundleID isEqualToString:@"com.spotify.client"];
+}
+
+static void tj_lmNowPlayingIsSpotify(void (^completion)(BOOL isSpotify)) {
+    TJLMGetClientFunc getClient = (TJLMGetClientFunc)dlsym(RTLD_DEFAULT, "MRMediaRemoteGetNowPlayingClient");
+    if (!getClient) { tj_lmLog(@"spotify: MRMediaRemoteGetNowPlayingClient missing"); completion(NO); return; }
+    getClient(dispatch_get_main_queue(), ^(id client) {
+        BOOL match = NO;
+        NSMutableArray *seen = [NSMutableArray array];
+        if (client) {
+            for (NSString *name in @[@"MRNowPlayingClientGetBundleIdentifier", @"MRNowPlayingClientGetParentAppBundleIdentifier"]) {
+                TJLMClientBundleFunc fn = (TJLMClientBundleFunc)dlsym(RTLD_DEFAULT, name.UTF8String);
+                NSString *bundleID = fn ? (__bridge NSString *)fn(client) : nil;
+                if ([bundleID isKindOfClass:[NSString class]]) [seen addObject:bundleID];
+                if ([bundleID isKindOfClass:[NSString class]] && tj_lmIsSpotifyBundle(bundleID)) { match = YES; break; }
+            }
+        }
+        tj_lmLog(@"spotify: now playing client %@ -> %@", client ? [seen componentsJoinedByString:@","] : @"(none)", match ? @"spotify" : @"not spotify");
+        completion(match);
+    });
+}
+
+static void tj_lmResolveSpotify(TJLockMotionView *mv, NSString *key, NSString *albumTitle, NSString *artist, NSString *title) {
+    if (!prefBool(@"lockScreenSpotifyMotion", YES)) { tj_lmLog(@"spotify: switched off in settings"); tj_lmGiveUp(mv); return; }
+    __weak TJLockMotionView *weakMV = mv;
+    void (^lookup)(NSString *, NSString *, NSString *) = ^(NSString *t, NSString *a, NSString *al) {
+        tj_fetchMotionVideoForMetadata(t, a, al, ^(NSURL *url) {
+            TJLockMotionView *m = weakMV;
+            tj_lmLog(@"spotify: \"%@\" by \"%@\" on \"%@\" -> %@", t, a, al ?: @"", url ? url.absoluteString : @"no animated artwork found");
+            if (!m || ![m.trackKey isEqualToString:key]) return;
+            if (!url) { tj_lmGiveUp(m); return; }
+            tj_lmLoadResolved(m, key, url);
+        });
+    };
+    tj_lmNowPlayingIsSpotify(^(BOOL isSpotify) {
+        TJLockMotionView *m = weakMV;
+        if (!m || ![m.trackKey isEqualToString:key]) return;
+        if (!isSpotify) { tj_lmGiveUp(m); return; }
+        if (title.length && artist.length) { lookup(title, artist, albumTitle); return; }
+        TJLMGetInfoFunc getInfo = (TJLMGetInfoFunc)dlsym(RTLD_DEFAULT, "MRMediaRemoteGetNowPlayingInfo");
+        if (!getInfo) { tj_lmGiveUp(m); return; }
+        getInfo(dispatch_get_main_queue(), ^(CFDictionaryRef cfInfo) {
+            TJLockMotionView *m2 = weakMV;
+            if (!m2 || ![m2.trackKey isEqualToString:key]) return;
+            NSDictionary *info = (__bridge NSDictionary *)cfInfo;
+            if (![info isKindOfClass:[NSDictionary class]]) { tj_lmGiveUp(m2); return; }
+            NSString *t = tj_lmString(info[@"kMRMediaRemoteNowPlayingInfoTitle"]) ?: title;
+            NSString *a = tj_lmString(info[@"kMRMediaRemoteNowPlayingInfoArtist"]) ?: artist;
+            NSString *al = tj_lmString(info[@"kMRMediaRemoteNowPlayingInfoAlbum"]) ?: albumTitle;
+            if (!t.length || !a.length) { tj_lmGiveUp(m2); return; }
+            lookup(t, a, al);
+        });
+    });
+}
+
 static void tj_lmResolveAndLoad(TJLockMotionView *mv, NSString *key, NSString *songID, NSString *albumID,
                                 NSString *albumTitle, NSString *artist, NSString *title, NSURL *modelURL) {
     if (modelURL) {
@@ -458,9 +555,7 @@ static void tj_lmResolveAndLoad(TJLockMotionView *mv, NSString *key, NSString *s
         return;
     }
     if (!songID.length && !albumID.length) {
-        [mv teardown];
-        mv.trackKey = nil;
-        mv.retryAfter = CACurrentMediaTime() + 20.0;
+        tj_lmResolveSpotify(mv, key, albumTitle, artist, title);
         return;
     }
     __weak TJLockMotionView *weakMV = mv;
@@ -483,11 +578,14 @@ static void tj_lmRefreshTrack(MRUArtworkView *artworkView, TJLockMotionView *mv)
     id response = tj_lmKVC(artworkView, @"artwork.response");
     id item = tj_lmKVC(response, @"tracklist.playingItem");
     NSString *key = item ? tj_itemTrackKey(item) : nil;
+    // a pointer-derived key means the item carries no usable metadata; ask MediaRemote instead
+    if ([key hasPrefix:@"0x"]) key = nil;
     if (key.length > 0) {
         if ([key isEqualToString:mv.trackKey]) { [mv updatePlayback]; return; }
         if (!mv.trackKey && CACurrentMediaTime() < mv.retryAfter) return;
         mv.trackKey = key;
         [mv teardown];
+        tj_lmLog(@"track from player item: key %@ songID %@ albumID %@", key, tj_extractAdamID(item) ?: @"-", tj_extractAlbumAdamID(item) ?: @"-");
         NSString *title = nil, *artist = nil;
         for (NSString *kp in @[@"title", @"metadataObject.song.title", @"metadataObject.title"]) {
             title = tj_lmString(tj_lmKVC(item, kp)); if (title) break;
@@ -521,6 +619,7 @@ static void tj_lmRefreshTrack(MRUArtworkView *artworkView, TJLockMotionView *mv)
         if (!m.trackKey && CACurrentMediaTime() < m.retryAfter) return;
         m.trackKey = k;
         [m teardown];
+        tj_lmLog(@"track from MediaRemote: key %@ songID %@ albumID %@", k, songID ?: @"-", albumID ?: @"-");
         tj_lmResolveAndLoad(m, k, songID, albumID, album, artist, title, nil);
     });
 }
@@ -687,6 +786,7 @@ static void tj_lmObserveState(void) {
             return;
         }
         %init(LockMotion, TJLMBackgroundView = bgView, TJLMBackgroundVC = bgVC);
+        tj_lmLog(@"loaded into MediaRemoteUI");
         tj_lmPublishFullscreen(NO);
         tj_lmObserveState();
     }

@@ -57,7 +57,7 @@ static NSDictionary *buildPrefsSnapshot(void) {
 
     NSArray *standardKeys = @[
         @"enabled", @"albumDetailEnabled", @"albumSaturation", @"albumBrightness",
-        @"immersiveNowPlaying", @"immersiveMotionArtwork",
+        @"immersiveNowPlaying", @"immersiveMotionArtwork", @"lockScreenSpotifyMotion",
         @"lastFmEnabled", @"lastFmShowBadge", @"lastFmNowPlayingEnabled",
         @"lastFmThreshold", @"lastFmBlacklistedArtists", @"lastFmBlacklistedAlbums",
         @"lastFmSessionKey", @"lastFmUsername", @"blacklistFormat"
