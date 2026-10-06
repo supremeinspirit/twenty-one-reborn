@@ -42,6 +42,7 @@ static NSHashTable<UIView *> *sTJLCHiddenWidgets = nil;
 @property (nonatomic, weak) UIView *dateView;
 @property (nonatomic, weak) UIView *dateLabel;
 @property (nonatomic, strong) NSArray<UIView *> *widgets;
+@property (nonatomic, assign) BOOL widgetsAll;
 @property (nonatomic, assign) BOOL compactApplied;
 @end
 @implementation TJLCFound
@@ -99,7 +100,13 @@ static BOOL tj_lcIsWidgetClass(UIView *v) {
     return [cls containsString:@"WidgetHost"] || [cls isEqualToString:@"CSProminentEmptyElementView"];
 }
 
-static NSArray<UIView *> *tj_lcFindRowWidgets(TJLCFound *f, UIWindow *win, CGRect row) {
+// Off: only the widgets beside the date make room for the compact clock row.
+// On: every lock screen complication steps aside while the artwork plays.
+static BOOL tj_lcHideAllComplications(void) {
+    return prefBool(@"lockScreenHideComplications", YES);
+}
+
+static NSArray<UIView *> *tj_lcFindWidgets(TJLCFound *f, UIWindow *win, CGRect row, BOOL all) {
     NSMutableArray<UIView *> *all = [NSMutableArray array];
     tj_lcCollect(win, ^BOOL(UIView *v) { return tj_lcIsWidgetClass(v); }, all);
     NSMutableArray<UIView *> *out = [NSMutableArray array];
@@ -108,7 +115,8 @@ static NSArray<UIView *> *tj_lcFindRowWidgets(TJLCFound *f, UIWindow *win, CGRec
         if (f.dateView && tj_lcIsDescendant(f.dateView, v)) continue;
         if (f.dateLabel && tj_lcIsDescendant(f.dateLabel, v)) continue;
         CGRect r = tj_lcWindowRect(v);
-        if (r.size.height < 1 || fabs(CGRectGetMidY(r) - CGRectGetMidY(row)) > MAX(row.size.height, 20)) continue;
+        if (r.size.height < 1) continue;
+        if (!all && fabs(CGRectGetMidY(r) - CGRectGetMidY(row)) > MAX(row.size.height, 20)) continue;
         BOOL nested = NO;
         for (UIView *p = v.superview; p; p = p.superview) if ([out containsObject:p]) { nested = YES; break; }
         if (!nested) [out addObject:v];
@@ -242,7 +250,14 @@ static void tj_lcApply(UIView *displayView, BOOL animated) {
         if (!win || !host) return;
 
         BOOL firstApply = !f.compactApplied;
-        if (firstApply || !f.widgets) f.widgets = tj_lcFindRowWidgets(f, win, tj_lcWindowRect(dateView));
+        BOOL all = tj_lcHideAllComplications();
+        if (!firstApply && f.widgetsAll != all) {
+            tj_lcRestoreWidgets();
+            f.widgets = nil;
+        }
+        // Widgets can join the lock screen after the first pass, so an empty result is looked up again.
+        if (firstApply || f.widgets.count == 0) f.widgets = tj_lcFindWidgets(f, win, tj_lcWindowRect(dateView), all);
+        f.widgetsAll = all;
         f.compactApplied = YES;
 
         TJLCRowLabel *row = objc_getAssociatedObject(displayView, kTJLCRowLabelKey);
