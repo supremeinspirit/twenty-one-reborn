@@ -9,6 +9,7 @@
 #import "TJPrefsStore.h"
 #import "TJModelUtils.h"
 #import "TJMotionArtworkResolver.h"
+#import "TJCanvasShare.h"
 
 @interface MRUArtworkView : UIControl
 @end
@@ -145,7 +146,19 @@ static NSString *tj_lmAttr(NSString *line, NSString *name) {
     return end.location == NSNotFound ? nil : [line substringWithRange:NSMakeRange(start, end.location - start)];
 }
 
+static NSURL *tj_lmDownloadFileSync(NSURL *fileURL) {
+    NSError *err = nil;
+    NSData *data = tj_lmFetchSync(fileURL, &err);
+    if (data.length < 1024 || data.length > 80ull * 1024 * 1024) return nil;
+    NSString *finalPath = tj_lmCachePathForURL(fileURL);
+    [[NSFileManager defaultManager] createDirectoryAtPath:tj_lmCacheDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![data writeToFile:finalPath atomically:YES]) return nil;
+    tj_lmTrimCache();
+    return [NSURL fileURLWithPath:finalPath];
+}
+
 static NSURL *tj_lmDownloadVariantSync(NSURL *playlistURL) {
+    if ([playlistURL.pathExtension.lowercaseString isEqualToString:@"mp4"]) return tj_lmDownloadFileSync(playlistURL);
     NSError *err = nil;
     NSData *pd = tj_lmFetchSync(playlistURL, &err);
     NSString *playlist = pd ? [[NSString alloc] initWithData:pd encoding:NSUTF8StringEncoding] : nil;
@@ -521,6 +534,13 @@ static void tj_lmResolveSpotify(TJLockMotionView *mv, NSString *key, NSString *a
             TJLockMotionView *m = weakMV;
             tj_lmLog(@"spotify: \"%@\" by \"%@\" on \"%@\" -> %@", t, a, al ?: @"", url ? url.absoluteString : @"no animated artwork found");
             if (!m || ![m.trackKey isEqualToString:key]) return;
+            if (!url && prefBool(@"lockScreenSpotifyCanvas", YES)) {
+                // Second source: the track's own Canvas, as the Spotify app publishes it.
+                NSURL *canvas = nil;
+                BOOL known = TJCanvasShareRead(t, &canvas);
+                tj_lmLog(@"spotify: canvas for \"%@\" -> %@", t, canvas ? canvas.absoluteString : (known ? @"this track has none" : @"nothing published for this track yet"));
+                url = canvas;
+            }
             if (!url) { tj_lmGiveUp(m); return; }
             tj_lmLoadResolved(m, key, url);
         });
@@ -774,6 +794,18 @@ static void tj_lmObserveState(void) {
         notify_get_state(token, &state);
         sTJLMScreenBlanked = (state != 0);
         tj_lmUpdateAll();
+    });
+
+    // Spotify can publish a track's Canvas after the lock screen has already asked for it:
+    // a view that is showing nothing asks again.
+    static int canvasToken = 0;
+    notify_register_dispatch(TJCanvasShareChangedNotification.UTF8String, &canvasToken, dispatch_get_main_queue(), ^(__unused int token) {
+        tj_lmForEachMotionView(^(TJLockMotionView *v) {
+            if (v.showingVideo || v.videoURL || v.trackKey) return;
+            v.lastInfoQuery = 0;
+            v.retryAfter = 0;
+            [v.superview setNeedsLayout];
+        });
     });
 }
 

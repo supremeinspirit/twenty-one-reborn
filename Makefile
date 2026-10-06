@@ -5,7 +5,7 @@ THEOS_PACKAGE_SCHEME = rootless
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = TwentyOne TwentyOneScrobbler TwentyOneLockScreen
+TWEAK_NAME = TwentyOne TwentyOneScrobbler TwentyOneLockScreen TwentyOneSpotify
 
 TwentyOne_FILES = Tweak.x \
 	TJHomeTab.x \
@@ -35,9 +35,15 @@ TwentyOneScrobbler_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 TwentyOneLockScreen_FILES = TJLockScreenMotion.x \
 	TJMotionArtworkResolver.m \
 	TJModelUtils.m \
-	TJPrefsStore.m
+	TJPrefsStore.m \
+	TJCanvasShare.m
 TwentyOneLockScreen_FRAMEWORKS = UIKit AVFoundation QuartzCore CoreGraphics
 TwentyOneLockScreen_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+
+TwentyOneSpotify_FILES = TJSpotifyCanvas.x \
+	TJCanvasShare.m
+TwentyOneSpotify_FRAMEWORKS = Foundation
+TwentyOneSpotify_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 BUNDLE_NAME = TwentyOnePrefs
 
